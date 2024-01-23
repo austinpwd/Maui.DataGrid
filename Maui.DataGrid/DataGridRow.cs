@@ -1,10 +1,12 @@
 namespace Maui.DataGrid;
 
-using Maui.DataGrid.Extensions;
+using Extensions;
 using Microsoft.Maui.Controls;
 
 internal sealed class DataGridRow : Grid
 {
+    private delegate bool ParserDelegate(string value);
+
     #region Fields
 
     private Color? _bgColor;
@@ -21,12 +23,18 @@ internal sealed class DataGridRow : Grid
         set => SetValue(DataGridProperty, value);
     }
 
+    public object RowToEdit
+    {
+        get => GetValue(RowToEditProperty);
+        set => SetValue(RowToEditProperty, value);
+    }
+
     #endregion Properties
 
     #region Bindable Properties
 
     public static readonly BindableProperty DataGridProperty =
-        BindablePropertyExtensions.Create<DataGrid>(null, BindingMode.OneTime,
+        BindablePropertyExtensions.Create<DataGridRow, DataGrid>(null, BindingMode.OneTime,
             propertyChanged: (b, o, n) =>
             {
                 var self = (DataGridRow)b;
@@ -34,11 +42,38 @@ internal sealed class DataGridRow : Grid
                 if (o is DataGrid oldDataGrid)
                 {
                     oldDataGrid.ItemSelected -= self.DataGrid_ItemSelected;
+                    oldDataGrid.Columns.CollectionChanged -= self.OnColumnsChanged;
+
+                    foreach (var column in oldDataGrid.Columns)
+                    {
+                        column.VisibilityChanged -= self.OnVisibilityChanged;
+                    }
                 }
 
-                if (n is DataGrid newDataGrid && newDataGrid.SelectionEnabled)
+                if (n is DataGrid newDataGrid)
                 {
                     newDataGrid.ItemSelected += self.DataGrid_ItemSelected;
+                    newDataGrid.Columns.CollectionChanged += self.OnColumnsChanged;
+
+                    foreach (var column in newDataGrid.Columns)
+                    {
+                        column.VisibilityChanged += self.OnVisibilityChanged;
+                    }
+                }
+            });
+
+    public static readonly BindableProperty RowToEditProperty =
+        BindablePropertyExtensions.Create<DataGridRow, object>(null, BindingMode.OneWay,
+            propertyChanged: (b, o, n) =>
+            {
+                if (o == n || b is not DataGridRow row)
+                {
+                    return;
+                }
+
+                if (o == row.BindingContext || n == row.BindingContext)
+                {
+                    row.CreateView();
                 }
             });
 
@@ -48,54 +83,98 @@ internal sealed class DataGridRow : Grid
 
     private void CreateView()
     {
-        ColumnDefinitions.Clear();
-        Children.Clear();
+        UpdateColors();
 
-        SetStyling();
+        if (DataGrid.Columns == null || DataGrid.Columns.Count == 0)
+        {
+            ColumnDefinitions.Clear();
+            return;
+        }
 
         for (var i = 0; i < DataGrid.Columns.Count; i++)
         {
             var col = DataGrid.Columns[i];
 
-            ColumnDefinitions.Add(col.ColumnDefinition);
+            // Add or update columns as needed
+            if (i > ColumnDefinitions.Count - 1)
+            {
+                ColumnDefinitions.Add(col.ColumnDefinition);
+            }
+            else if (ColumnDefinitions[i] != col.ColumnDefinition)
+            {
+                ColumnDefinitions[i] = col.ColumnDefinition;
+            }
 
             if (!col.IsVisible)
             {
                 continue;
             }
 
-            var cell = CreateCell(col);
+            if (Children.TryGetItem(i, out var existingChild))
+            {
+                if (existingChild is not DataGridCell existingCell)
+                {
+                    throw new InvalidDataException($"{nameof(DataGridRow)} should only contain {nameof(DataGridCell)}s");
+                }
 
-            SetColumn((BindableObject)cell, i);
-            Children.Add(cell);
+                var isEditing = RowToEdit == BindingContext;
+
+                if (existingCell.Column != col || existingCell.IsEditing != isEditing)
+                {
+                    Children[i] = GenerateCellForColumn(col, i);
+                }
+            }
+            else
+            {
+                var newCell = GenerateCellForColumn(col, i);
+                Children.Add(newCell);
+            }
+        }
+
+        // Remove extra columns
+        for (var i = ColumnDefinitions.Count - 1; i > DataGrid.Columns.Count - 1; i--)
+        {
+            ColumnDefinitions.RemoveAt(i);
         }
     }
 
-    private void SetStyling()
+    private DataGridCell GenerateCellForColumn(DataGridColumn col, int columnIndex)
     {
-        UpdateColors();
+        var dataGridCell = CreateCell(col);
 
-        // We are using the spacing between rows to generate visible borders, and thus the background color is the border color.
-        BackgroundColor = DataGrid.BorderColor;
+        dataGridCell.UpdateBindings(DataGrid);
 
-        var borderThickness = DataGrid.BorderThickness;
+        SetColumn((BindableObject)dataGridCell, columnIndex);
 
-        Padding = new(borderThickness.Left, borderThickness.Top, borderThickness.Right, 0);
-        ColumnSpacing = borderThickness.HorizontalThickness;
-        Margin = new Thickness(0, 0, 0, borderThickness.Bottom); // Row Spacing
+        return dataGridCell;
     }
 
-    private View CreateCell(DataGridColumn col)
+    private DataGridCell CreateCell(DataGridColumn col)
+    {
+        View cellContent;
+
+        var isEditing = RowToEdit == BindingContext;
+
+        if (isEditing)
+        {
+            cellContent = CreateEditCell(col);
+        }
+        else
+        {
+            cellContent = CreateViewCell(col);
+
+        }
+
+        return new DataGridCell(cellContent, _bgColor, col, isEditing);
+    }
+
+    private View CreateViewCell(DataGridColumn col)
     {
         View cell;
 
         if (col.CellTemplate != null)
         {
-            cell = new ContentView
-            {
-                BackgroundColor = _bgColor,
-                Content = col.CellTemplate.CreateContent() as View
-            };
+            cell = (View)col.CellTemplate.CreateContent();
 
             if (!string.IsNullOrWhiteSpace(col.PropertyName))
             {
@@ -119,7 +198,6 @@ internal sealed class DataGridRow : Grid
             cell = new Label
             {
                 TextColor = _textColor,
-                BackgroundColor = _bgColor,
                 VerticalTextAlignment = col.VerticalTextAlignment,
                 HorizontalTextAlignment = col.HorizontalTextAlignment,
                 LineBreakMode = col.LineBreakMode,
@@ -129,28 +207,145 @@ internal sealed class DataGridRow : Grid
 
             if (!string.IsNullOrWhiteSpace(col.PropertyName))
             {
-                if (BindingContext is System.Data.DataRowView dataRowView)
-                {
-                    if (dataRowView.Row.Table.Columns.Contains(col.PropertyName))
-                    {
-                        cell.SetBinding(Label.TextProperty,
-                            new Binding($"[{col.PropertyName}]", BindingMode.Default, stringFormat: col.StringFormat, source: dataRowView));
-                    }
-                }
-                else
-                {
-                    cell.SetBinding(Label.TextProperty,
-                        new Binding(col.PropertyName, BindingMode.Default, stringFormat: col.StringFormat, source: BindingContext));
-                }
+                cell.SetBinding(Label.TextProperty,
+                    new Binding(col.PropertyName, stringFormat: col.StringFormat, source: BindingContext));
             }
         }
 
         return cell;
     }
 
+    private View CreateEditCell(DataGridColumn col)
+    {
+        var cell = GenerateTemplatedEditCell(col);
+
+        return cell ?? CreateDefaultEditCell(col);
+    }
+
+    private View CreateDefaultEditCell(DataGridColumn col)
+    {
+        return Type.GetTypeCode(col.DataType) switch
+        {
+            TypeCode.String => GenerateTextEditCell(col),
+            TypeCode.Boolean => GenerateBooleanEditCell(col),
+            TypeCode.Decimal => GenerateNumericEditCell(col, v => decimal.TryParse(v.TrimEnd(',', '.'), out _)),
+            TypeCode.Double => GenerateNumericEditCell(col, v => double.TryParse(v.TrimEnd(',', '.'), out _)),
+            TypeCode.Int16 => GenerateNumericEditCell(col, v => short.TryParse(v, out _)),
+            TypeCode.Int32 => GenerateNumericEditCell(col, v => int.TryParse(v, out _)),
+            TypeCode.Int64 => GenerateNumericEditCell(col, v => long.TryParse(v, out _)),
+            TypeCode.SByte => GenerateNumericEditCell(col, v => sbyte.TryParse(v, out _)),
+            TypeCode.Single => GenerateNumericEditCell(col, v => float.TryParse(v.TrimEnd(',', '.'), out _)),
+            TypeCode.UInt16 => GenerateNumericEditCell(col, v => ushort.TryParse(v, out _)),
+            TypeCode.UInt32 => GenerateNumericEditCell(col, v => uint.TryParse(v, out _)),
+            TypeCode.UInt64 => GenerateNumericEditCell(col, v => ulong.TryParse(v, out _)),
+            TypeCode.DateTime => GenerateDateTimeEditCell(col),
+            _ => new TemplatedView(),
+        };
+    }
+
+    private View? GenerateTemplatedEditCell(DataGridColumn col)
+    {
+        if (col.EditCellTemplate == null)
+        {
+            return null;
+        }
+
+        var cell = (View)col.EditCellTemplate.CreateContent();
+
+        if (!string.IsNullOrWhiteSpace(col.PropertyName))
+        {
+            cell.SetBinding(BindingContextProperty,
+                new Binding(col.PropertyName, source: BindingContext));
+        }
+
+        return cell;
+    }
+
+    private Entry GenerateTextEditCell(DataGridColumn col)
+    {
+        var entry = new Entry
+        {
+            TextColor = _textColor,
+            VerticalTextAlignment = col.VerticalTextAlignment,
+            HorizontalTextAlignment = col.HorizontalTextAlignment,
+            FontSize = DataGrid.FontSize,
+            FontFamily = DataGrid.FontFamily
+        };
+
+        if (!string.IsNullOrWhiteSpace(col.PropertyName))
+        {
+            entry.SetBinding(Entry.TextProperty,
+                new Binding(col.PropertyName, BindingMode.TwoWay, stringFormat: col.StringFormat, source: BindingContext));
+        }
+
+        return entry;
+    }
+
+    private CheckBox GenerateBooleanEditCell(DataGridColumn col)
+    {
+        var checkBox = new CheckBox
+        {
+            Color = _textColor,
+            BackgroundColor = _bgColor,
+        };
+
+        if (!string.IsNullOrWhiteSpace(col.PropertyName))
+        {
+            checkBox.SetBinding(CheckBox.IsCheckedProperty,
+                new Binding(col.PropertyName, BindingMode.TwoWay, source: BindingContext));
+        }
+
+        return checkBox;
+    }
+
+    private Entry GenerateNumericEditCell(DataGridColumn col, ParserDelegate parserDelegate)
+    {
+        var entry = new Entry
+        {
+            TextColor = _textColor,
+            VerticalTextAlignment = col.VerticalTextAlignment,
+            HorizontalTextAlignment = col.HorizontalTextAlignment,
+            FontSize = DataGrid.FontSize,
+            FontFamily = DataGrid.FontFamily,
+            Keyboard = Keyboard.Numeric
+        };
+
+        entry.TextChanged += (s, e) =>
+        {
+            if (!string.IsNullOrEmpty(e.NewTextValue) && !parserDelegate(e.NewTextValue))
+            {
+                ((Entry)s!).Text = e.OldTextValue;
+            }
+        };
+
+        if (!string.IsNullOrWhiteSpace(col.PropertyName))
+        {
+            entry.SetBinding(Entry.TextProperty,
+                new Binding(col.PropertyName, BindingMode.TwoWay, source: BindingContext));
+        }
+
+        return entry;
+    }
+
+    private DatePicker GenerateDateTimeEditCell(DataGridColumn col)
+    {
+        var datePicker = new DatePicker
+        {
+            TextColor = _textColor,
+        };
+
+        if (!string.IsNullOrWhiteSpace(col.PropertyName))
+        {
+            datePicker.SetBinding(DatePicker.DateProperty,
+                new Binding(col.PropertyName, BindingMode.TwoWay, source: BindingContext));
+        }
+
+        return datePicker;
+    }
+
     private void UpdateColors()
     {
-        _hasSelected = DataGrid.SelectedItem == BindingContext;
+        _hasSelected = DataGrid.SelectedItem == BindingContext || DataGrid.SelectedItems.Contains(BindingContext);
         var rowIndex = DataGrid.InternalItems?.IndexOf(BindingContext) ?? -1;
 
         if (rowIndex < 0)
@@ -158,22 +353,14 @@ internal sealed class DataGridRow : Grid
             return;
         }
 
-        _bgColor = DataGrid.SelectionEnabled && _hasSelected
+        _bgColor = DataGrid.SelectionMode != SelectionMode.None && _hasSelected
                 ? DataGrid.ActiveRowColor
                 : DataGrid.RowsBackgroundColorPalette.GetColor(rowIndex, BindingContext);
         _textColor = DataGrid.RowsTextColorPalette.GetColor(rowIndex, BindingContext);
 
-        foreach (var v in Children)
+        foreach (var cell in Children.OfType<DataGridCell>())
         {
-            if (v is View view)
-            {
-                view.BackgroundColor = _bgColor;
-
-                if (view is Label label)
-                {
-                    label.TextColor = _textColor;
-                }
-            }
+            cell.UpdateCellColors(_bgColor, _textColor);
         }
     }
 
@@ -181,11 +368,7 @@ internal sealed class DataGridRow : Grid
     protected override void OnBindingContextChanged()
     {
         base.OnBindingContextChanged();
-
-        if (BindingContext != DataGrid.BindingContext)
-        {
-            CreateView();
-        }
+        CreateView();
     }
 
     /// <inheritdoc/>
@@ -196,17 +379,28 @@ internal sealed class DataGridRow : Grid
         if (Parent == null)
         {
             DataGrid.ItemSelected -= DataGrid_ItemSelected;
+            DataGrid.Columns.CollectionChanged -= OnColumnsChanged;
+
+            foreach (var column in DataGrid.Columns)
+            {
+                column.VisibilityChanged -= OnVisibilityChanged;
+            }
         }
+    }
+
+    private void OnColumnsChanged(object? sender, EventArgs e)
+    {
+        CreateView();
+    }
+
+    private void OnVisibilityChanged(object? sender, EventArgs e)
+    {
+        CreateView();
     }
 
     private void DataGrid_ItemSelected(object? sender, SelectionChangedEventArgs e)
     {
-        if (!DataGrid.SelectionEnabled)
-        {
-            return;
-        }
-
-        if (_hasSelected || (e.CurrentSelection.Count > 0 && e.CurrentSelection[^1] == BindingContext))
+        if (_hasSelected || (e.CurrentSelection.Count > 0 && e.CurrentSelection.Any(s => s == BindingContext)))
         {
             UpdateColors();
         }
